@@ -45,16 +45,10 @@ class Particle {
         const opacity = this.life / this.maxLife;
         ctx.globalAlpha = opacity;
         
-        // Create gradient for more dramatic effect
-        const gradient = ctx.createRadialGradient(
-            this.x, this.y, 0,
-            this.x, this.y, this.radius
-        );
-        gradient.addColorStop(0, '#ffffff'); // White center
-        gradient.addColorStop(0.3, this.color); // Main color
-        gradient.addColorStop(1, 'rgba(0,0,0,0)'); // Transparent edge
-        
-        ctx.fillStyle = gradient;
+        // Set fill style to the particle's solid color
+        ctx.fillStyle = this.color; 
+
+        // Draw the particle as a solid circle
         ctx.beginPath();
         ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
         ctx.fill();
@@ -190,9 +184,17 @@ class Bomb {
     timeToLive: number; // Time before the bomb explodes
     explosion: Explosion | null;
     isExploding: boolean;
-    size: number; // Size multiplier for explosions
+    size: number; // Size multiplier for explosions (NOW SET FROM PLAYER)
+    onExplodeCallback: (x: number, y: number, size: number) => void; // Callback for destruction
     
-    constructor(x: number, y: number, direction: 'left' | 'right', strength: number = 8) {
+    constructor(
+        x: number, 
+        y: number, 
+        direction: 'left' | 'right', 
+        strength: number = 8,
+        onExplode: (x: number, y: number, size: number) => void, // Accept callback with size
+        size: number = 1 // Accept size multiplier
+    ) {
         this.x = x;
         this.y = y;
         this.vx = direction === 'right' ? strength : -strength; // Initial velocity based on direction
@@ -204,15 +206,18 @@ class Bomb {
         this.timeToLive = 120; // 2 seconds at 60fps
         this.explosion = null;
         this.isExploding = false;
-        this.size = 1; // Default size
+        this.size = size; // Store the provided size
+        this.onExplodeCallback = onExplode; // Store callback
     }
     
     explode() {
-        // Create explosion at current bomb position
-        this.explosion = new Explosion(this.x, this.y, this.size);
+        // Create visual explosion at current bomb position
+        this.explosion = new Explosion(this.x, this.y, this.size); 
         this.isExploding = true;
         // Make the bomb appear invisible now but keep it active until explosion completes
         this.radius = 0;
+        // Trigger the destruction callback, passing position AND size
+        this.onExplodeCallback(this.x, this.y, this.size);
     }
     
     update() {
@@ -289,75 +294,87 @@ class Bomb {
         }
     }
     
-    // Check collision with ground blocks
+    // Reworked collision using AABB Minimum Penetration
     collideWithMap(groundMap: Map<string, GroundBlockData>, blockSize: number) {
-        if (this.isExploding) return;
-        
-        // Calculate bomb bounds
-        const bombLeft = this.x - this.radius;
-        const bombRight = this.x + this.radius;
-        const bombTop = this.y - this.radius;
-        const bombBottom = this.y + this.radius;
-        
-        // Check ground collision (bottom)
-        const checkMinGridX = Math.floor(bombLeft / blockSize);
-        const checkMaxGridX = Math.floor(bombRight / blockSize);
-        const checkGridY = Math.floor(bombBottom / blockSize);
-        
-        for (let gx = checkMinGridX; gx <= checkMaxGridX; gx++) {
-            const blockKey = `${gx},${checkGridY}`;
-            if (groundMap.has(blockKey)) {
-                const blockTop = checkGridY * blockSize;
-                const blockLeft = gx * blockSize;
-                const blockRight = blockLeft + blockSize;
+        if (this.isExploding) return; // No collision checks if exploding
 
-                // Check horizontal overlap with the block
-                if (bombRight > blockLeft && bombLeft < blockRight) {
-                    // Check if the bottom edge is now at or below the block's top edge
-                    if (bombBottom >= blockTop) {
-                        // Bounce with reduced velocity
-                        this.y = blockTop - this.radius;
-                        this.vy = -this.vy * 0.6; // Dampen bounce
-                        this.vx *= 0.8; // Add friction
+        // Define damping and friction constants for clarity
+        const bounceDamping = 0.6;
+        const frictionFactor = 0.6; // Increased friction (was 0.8)
+        const stopThreshold = 0.5; // Velocity below which we stop bouncing/sliding
+
+        // Get current bomb AABB bounds
+        let bombLeft = this.x - this.radius;
+        let bombRight = this.x + this.radius;
+        let bombTop = this.y - this.radius;
+        let bombBottom = this.y + this.radius;
+
+        // Determine the grid cell range the bomb might overlap
+        const minGx = Math.floor(bombLeft / blockSize);
+        const maxGx = Math.floor(bombRight / blockSize);
+        const minGy = Math.floor(bombTop / blockSize);
+        const maxGy = Math.floor(bombBottom / blockSize);
+
+        // Iterate through potentially colliding grid cells
+        for (let gy = minGy; gy <= maxGy; gy++) {
+            for (let gx = minGx; gx <= maxGx; gx++) {
+                const blockKey = `${gx},${gy}`;
+                
+                if (groundMap.has(blockKey)) {
+                    const blockLeft = gx * blockSize;
+                    const blockRight = blockLeft + blockSize;
+                    const blockTop = gy * blockSize;
+                    const blockBottom = blockTop + blockSize;
+
+                    // --- AABB Collision Check ---
+                    if (bombLeft < blockRight && bombRight > blockLeft && bombTop < blockBottom && bombBottom > blockTop) {
+                        // Collision detected!
                         
-                        // Stop very small bounces
-                        if (Math.abs(this.vy) < 0.5) {
-                            this.vy = 0;
+                        // --- Calculate Penetration Depth ---
+                        const overlapX = Math.min(bombRight - blockLeft, blockRight - bombLeft);
+                        const overlapY = Math.min(bombBottom - blockTop, blockBottom - bombTop);
+                        
+                        // --- Resolve Collision based on Minimum Penetration ---
+                        if (overlapY < overlapX) {
+                            // Resolve Vertically (Ground or Ceiling)
+                            if (this.vy >= 0 && bombBottom > blockTop && bombTop < blockTop) { // Moving down / landing
+                                this.y = blockTop - this.radius; // Align bottom with block top
+                                // Apply bounce and friction
+                                this.vy *= -bounceDamping;
+                                this.vx *= frictionFactor;
+                                // Stop small bounces
+                                if (Math.abs(this.vy) < stopThreshold) this.vy = 0;
+                            } else if (this.vy < 0 && bombTop < blockBottom && bombBottom > blockBottom) { // Moving up / hitting ceiling
+                                this.y = blockBottom + this.radius; // Align top with block bottom
+                                // Apply bounce and friction
+                                this.vy *= -bounceDamping;
+                                this.vx *= frictionFactor;
+                            }
+                        } else {
+                            // Resolve Horizontally (Walls)
+                            if (this.vx > 0 && bombRight > blockLeft && bombLeft < blockLeft) { // Moving right
+                                this.x = blockLeft - this.radius; // Align right with block left
+                                // Apply bounce and friction
+                                this.vx *= -bounceDamping;
+                                this.vy *= frictionFactor;
+                                // Stop small slides
+                                if (Math.abs(this.vx) < stopThreshold) this.vx = 0;
+                            } else if (this.vx < 0 && bombLeft < blockRight && bombRight > blockRight) { // Moving left
+                                this.x = blockRight + this.radius; // Align left with block right
+                                // Apply bounce and friction
+                                this.vx *= -bounceDamping;
+                                this.vy *= frictionFactor;
+                                 // Stop small slides
+                                if (Math.abs(this.vx) < stopThreshold) this.vx = 0;
+                            }
                         }
-                        return;
+                        
+                        // --- Re-calculate bomb bounds after resolution for next check ---
+                        bombLeft = this.x - this.radius;
+                        bombRight = this.x + this.radius;
+                        bombTop = this.y - this.radius;
+                        bombBottom = this.y + this.radius;
                     }
-                }
-            }
-        }
-
-        // Check wall collisions
-        const checkMinGridY = Math.floor(bombTop / blockSize);
-        const checkMaxGridY = Math.floor(bombBottom / blockSize);
-        
-        // Left wall
-        const leftGridX = Math.floor(bombLeft / blockSize);
-        for (let gy = checkMinGridY; gy <= checkMaxGridY; gy++) {
-            const blockKey = `${leftGridX},${gy}`;
-            if (groundMap.has(blockKey)) {
-                const blockRight = (leftGridX + 1) * blockSize;
-                if (bombLeft <= blockRight) {
-                    this.x = blockRight + this.radius;
-                    this.vx = -this.vx * 0.6; // Bounce off wall
-                    return;
-                }
-            }
-        }
-        
-        // Right wall
-        const rightGridX = Math.floor(bombRight / blockSize);
-        for (let gy = checkMinGridY; gy <= checkMaxGridY; gy++) {
-            const blockKey = `${rightGridX},${gy}`;
-            if (groundMap.has(blockKey)) {
-                const blockLeft = rightGridX * blockSize;
-                if (bombRight >= blockLeft) {
-                    this.x = blockLeft - this.radius;
-                    this.vx = -this.vx * 0.6; // Bounce off wall
-                    return;
                 }
             }
         }
@@ -456,6 +473,10 @@ export class Player {
     currentHipAnchorY: number;
     hipLerpFactor: number;
 
+    // Add Health Properties
+    maxHealth: number;
+    currentHealth: number;
+
     // Add bombs array to track bombs
     bombs: Bomb[];
     bombCooldown: number;
@@ -463,10 +484,20 @@ export class Player {
     bombChargeTime: number;     // How long the key has been held (frames)
     trajectoryPoints: {x: number, y: number}[]; // Points for drawing the preview
 
+    // Callback for bomb explosion effects (set from outside)
+    onExplodeCallback: (x: number, y: number, size: number, throwerId: string) => void;
+
     // Constants for Bomb Charging
     private MAX_BOMB_CHARGE_TIME: number = 90; // 1.5 seconds at 60fps
     private MIN_BOMB_THROW_STRENGTH: number = 4;
     private MAX_BOMB_THROW_STRENGTH: number = 12;
+
+    // Re-add Bop Properties for smooth amplitude transitions
+    targetBopAmplitude: number;
+    currentBopAmplitude: number;
+    bopLerpFactor: number;
+
+    id: string; // Unique identifier for the player
 
     constructor(x: number, y: number, width: number, height: number) {
         this.x = x;
@@ -577,12 +608,33 @@ export class Player {
         this.currentHipAnchorY = this.y + this.baseHeight / 2;
         this.hipLerpFactor = 0.55;
 
+        // Initialize Bop Properties (Re-added)
+        this.targetBopAmplitude = 0;
+        this.currentBopAmplitude = 0;
+        this.bopLerpFactor = 0.1; // Smoothing factor for amplitude changes
+
+        // Initialize Health
+        this.maxHealth = 100;
+        this.currentHealth = this.maxHealth;
+
         // Initialize bombs array and cooldown
         this.bombs = [];
         this.bombCooldown = 0;
         this.isChargingBomb = false;    // Is the player currently holding the bomb key?
         this.bombChargeTime = 0;     // How long the key has been held (frames)
         this.trajectoryPoints = []; // Points for drawing the preview
+        // Default empty callback, should be set by the game manager
+        this.onExplodeCallback = () => {}; 
+
+        this.id = `player-${Math.random().toString(36).substring(2, 9)}`; // Simple unique ID
+    }
+
+    // Method to apply damage to the player
+    takeDamage(amount: number) {
+        this.currentHealth -= amount;
+        // Clamp health to prevent it going below 0
+        this.currentHealth = Math.max(0, this.currentHealth);
+        // TODO: Maybe add a visual indicator for taking damage (e.g., brief flash)?
     }
 
     applyGravity() {
@@ -591,7 +643,7 @@ export class Player {
         }
     }
 
-    // NEW Collision Detection System
+    // NEW Collision Detection System (For Player)
     collideWithMap(groundMap: Map<string, GroundBlockData>, blockSize: number) {
         this.isOnGround = false; // Reset ground state each frame
 
@@ -632,14 +684,14 @@ export class Player {
                             // Resolve Vertically
                             if (this.vy >= 0 && hbBottom > blockTop && hbTop < blockTop) { // Moving down / landing
                                 this.y = blockTop - this.baseHeight - this.hitboxPaddingY; // Align bottom with block top
-                                this.vy = 0;
-                                this.isOnGround = true;
+            this.vy = 0;
+            this.isOnGround = true;
                                 this.isJumping = false; // Can jump again
                             } else if (this.vy < 0 && hbTop < blockBottom && hbBottom > blockBottom) { // Moving up / hitting ceiling
                                 this.y = blockBottom + this.hitboxPaddingY; // Align top with block bottom
                                 this.vy = 0;
                             }
-                        } else {
+        } else {
                             // Resolve Horizontally
                             if (this.vx > 0 && hbRight > blockLeft && hbLeft < blockLeft) { // Moving right
                                 this.x = blockLeft - this.baseWidth - this.hitboxPaddingX; // Align right with block left
@@ -749,11 +801,17 @@ export class Player {
 
         // --- Calculate Target Shoulder Anchor Positions (based on base width) --- 
         let targetTopShoulderX, targetBottomShoulderX;
+        const behindArmOffsetMultiplier = 1.2;
+        
         if (this.facingDirection === 'right') {
+            // Top arm is in front, use normal offset
             targetTopShoulderX = this.x + this.baseWidth / 2 - this.armHorizontalOffset;
-            targetBottomShoulderX = this.x + this.baseWidth / 2 + this.armHorizontalOffset;
+            // Bottom arm is behind, use increased offset
+            targetBottomShoulderX = this.x + this.baseWidth / 2 + (this.armHorizontalOffset * behindArmOffsetMultiplier);
         } else { // facingDirection === 'left'
-            targetTopShoulderX = this.x + this.baseWidth / 2 + this.armHorizontalOffset;
+            // Top arm is behind, use increased offset
+            targetTopShoulderX = this.x + this.baseWidth / 2 + (this.armHorizontalOffset * behindArmOffsetMultiplier);
+             // Bottom arm is in front, use normal offset
             targetBottomShoulderX = this.x + this.baseWidth / 2 - this.armHorizontalOffset;
         }
 
@@ -905,7 +963,7 @@ export class Player {
             targetFootXRight = currentAnchorRightX;
         }
 
-        // --- Lerp Current Foot Positions ---
+        // --- Lerp Current Foot Positions --- 
         this.currentLeftFootX = lerp(this.currentLeftFootX, targetFootXLeft, this.footLerpFactor);
         this.currentRightFootX = lerp(this.currentRightFootX, targetFootXRight, this.footLerpFactor);
 
@@ -964,46 +1022,7 @@ export class Player {
     }
 
     draw(ctx: CanvasRenderingContext2D, isDebugMode: boolean = false, otherPlayerEyeMidpoint: { x: number, y: number } | null = null) {
-        // Draw all active bombs
-        for (const bomb of this.bombs) {
-            bomb.draw(ctx);
-        }
-
-        // --- Draw Trajectory Preview if Charging ---
-        if (this.isChargingBomb && this.trajectoryPoints.length > 1) {
-            ctx.save(); // Save context state
-            
-            // Use a dashed line for the trajectory
-            ctx.setLineDash([5, 5]); 
-            
-            // Style the trajectory line
-            const chargeRatio = this.bombChargeTime / this.MAX_BOMB_CHARGE_TIME;
-            const startColor = [255, 255, 255]; // White
-            const endColor = [255, 0, 0]; // Red
-            const r = Math.round(lerp(startColor[0], endColor[0], chargeRatio));
-            const g = Math.round(lerp(startColor[1], endColor[1], chargeRatio));
-            const b = Math.round(lerp(startColor[2], endColor[2], chargeRatio));
-            ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.7)`; // Color changes with charge
-            ctx.lineWidth = 2;
-            
-            // Draw the trajectory line segments
-            ctx.beginPath();
-            ctx.moveTo(this.trajectoryPoints[0].x, this.trajectoryPoints[0].y);
-            for (let i = 1; i < this.trajectoryPoints.length; i++) {
-                ctx.lineTo(this.trajectoryPoints[i].x, this.trajectoryPoints[i].y);
-            }
-            ctx.stroke();
-            
-            // Draw small circles at each point for emphasis
-            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.5)`;
-            for (const point of this.trajectoryPoints) {
-                ctx.beginPath();
-                ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
-                ctx.fill();
-            }
-            
-            ctx.restore(); // Restore context state (including line dash)
-        }
+        // --- Bomb and Trajectory drawing removed, will be handled separately --- 
 
         const armCenterY = this.y + this.baseHeight / 2; // Use baseHeight for arm vertical center
         // Calculate Foot Anchor Y position (used for feet and debug anchors)
@@ -1305,38 +1324,65 @@ export class Player {
             ctx.fillText(`Vy (${this.vy.toFixed(1)})`, centerX + 5, endVerticalY + 5);
 
         } else {
+            // Non-debug rendering
+            
+            // --- Update Target Bop Amplitude Based on State ---
+            const MAX_BOP_AMPLITUDE = 2.1; // Keep the increased max amplitude
+            const currentHorizontalSpeedRatio = Math.min(Math.abs(this.vx) / this.maxSpeed, 1.0); 
+
+            if (this.isOnGround) {
+                this.targetBopAmplitude = MAX_BOP_AMPLITUDE * currentHorizontalSpeedRatio;
+            } else {
+                // Smoothly transition to zero amplitude when jumping/falling
+                this.targetBopAmplitude = 0;
+            }
+
+            // --- Smoothly Lerp Current Amplitude Towards Target ---
+            this.currentBopAmplitude = lerp(this.currentBopAmplitude, this.targetBopAmplitude, this.bopLerpFactor);
+
+            // --- Calculate Bop Offset using Constant Frequency and Lerped Amplitude ---
+            let bopOffsetY = 0;
+            const bopFrequency = this.armSwingFrequency * 1.6; // Lower, constant frequency
+            if (this.currentBopAmplitude > 0.05) { // Use the smoothly changing amplitude
+                bopOffsetY = Math.sin(this.walkCycleTimer * bopFrequency) * this.currentBopAmplitude;
+            }
+
             // Draw an improved character with rounded corners and gradient body
             // Use CURRENT animated dimensions
             
             // 1. Draw body with a gradient
-            const bodyGradient = ctx.createLinearGradient(this.x, this.y, this.x + this.currentWidth, this.y + this.currentHeight);
+            const bodyGradient = ctx.createLinearGradient(this.x, this.y + bopOffsetY, this.x + this.currentWidth, this.y + this.currentHeight + bopOffsetY);
             bodyGradient.addColorStop(0, this.color);
             bodyGradient.addColorStop(1, this.adjustColor(this.color, -30)); // Darker variant
             
-            // Rounded rectangle for the body using animated dimensions
-            this.roundRect(ctx, this.x, this.y, this.currentWidth, this.currentHeight, 10, bodyGradient);
+            // Rounded rectangle for the body using animated dimensions, applying bop offset
+            this.roundRect(ctx, this.x, this.y + bopOffsetY, this.currentWidth, this.currentHeight, 10, bodyGradient);
             
-            // 2. Draw eyes using CURRENT (lerped) positions
+            // 2. Draw eyes using CURRENT (lerped) positions, applying bop offset
+            const eyeDrawY = currentEyeY + bopOffsetY;
+            const leftPupilDrawY = leftPupilY + bopOffsetY;
+            const rightPupilDrawY = rightPupilY + bopOffsetY;
+            
             // White of the eyes
             ctx.fillStyle = 'white';
             ctx.beginPath();
-            ctx.arc(currentLeftEyeX, currentEyeY, eyeSize, 0, Math.PI * 2);
+            ctx.arc(currentLeftEyeX, eyeDrawY, eyeSize, 0, Math.PI * 2);
             ctx.fill();
             ctx.beginPath();
-            ctx.arc(currentRightEyeX, currentEyeY, eyeSize, 0, Math.PI * 2);
+            ctx.arc(currentRightEyeX, eyeDrawY, eyeSize, 0, Math.PI * 2);
             ctx.fill();
             
             // Pupils (looking towards other player or facing direction)
             ctx.fillStyle = 'black';
             ctx.beginPath();
-            ctx.arc(leftPupilX, leftPupilY, pupilSize, 0, Math.PI * 2);
+            ctx.arc(leftPupilX, leftPupilDrawY, pupilSize, 0, Math.PI * 2);
             ctx.fill();
             ctx.beginPath();
-            ctx.arc(rightPupilX, rightPupilY, pupilSize, 0, Math.PI * 2);
+            ctx.arc(rightPupilX, rightPupilDrawY, pupilSize, 0, Math.PI * 2);
             ctx.fill();
             
-            // 3. Draw a mouth (centered based on current width)
-            const mouthY = this.y + this.currentHeight / 2; // Center mouth vertically in animated body
+            // 3. Draw a mouth (centered based on current width), applying bop offset
+            const mouthY = this.y + this.currentHeight / 2 + bopOffsetY; // Center mouth vertically in animated body, apply bop
             const mouthWidth = this.currentWidth / 3; // Scale mouth width
             
             ctx.strokeStyle = 'black';
@@ -1392,11 +1438,91 @@ export class Player {
         ctx.beginPath();
         ctx.arc(topHandCenterX, topHandCenterY, this.handRadius, 0, Math.PI * 2);
         ctx.fill();
+
+        // --- Health Bar Drawing ---
+        const healthBarWidth = this.baseWidth * 1.2;
+        const healthBarHeight = 6; // Slightly thicker
+        const healthBarX = this.x + (this.baseWidth - healthBarWidth) / 2;
+        const healthBarY = this.y - this.hitboxPaddingY - healthBarHeight - 5;
+        
+        // Clean background (no shadow)
+        ctx.fillStyle = '#333';
+        this.roundRect(ctx, healthBarX, healthBarY, healthBarWidth, healthBarHeight, 3, '#333');
+        
+        // Health fill with solid color
+        const healthRatio = this.currentHealth / this.maxHealth;
+        const currentHealthWidth = healthBarWidth * healthRatio;
+        
+        // Choose color based on health percentage
+        let healthColor;
+        if (healthRatio > 0.6) {
+            healthColor = '#2ecc71'; // Green
+        } else if (healthRatio > 0.3) {
+            healthColor = '#f39c12'; // Orange
+        } else {
+            healthColor = '#e74c3c'; // Red
+        }
+        
+        // Draw health fill with rounded corners
+        if (healthRatio > 0) {
+            this.roundRect(ctx, healthBarX, healthBarY, currentHealthWidth, healthBarHeight, 3, healthColor);
+        }
+        
+        // Minimal border (almost none)
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)'; // Even fainter border
+        ctx.lineWidth = 0.5;
+        this.roundRect(ctx, healthBarX, healthBarY, healthBarWidth, healthBarHeight, 3, 'transparent', true);
+
+        // New method specifically for drawing bombs and trajectory
+        this.drawBombs(ctx);
+    }
+
+    // New method specifically for drawing bombs and trajectory
+    drawBombs(ctx: CanvasRenderingContext2D) {
+        // Draw all active bombs
+        for (const bomb of this.bombs) {
+            bomb.draw(ctx);
+        }
+
+        // --- Draw Trajectory Preview if Charging ---
+        if (this.isChargingBomb && this.trajectoryPoints.length > 1) {
+            ctx.save(); // Save context state
+            
+            // Use a dashed line for the trajectory
+            ctx.setLineDash([5, 5]); 
+            
+            // Style the trajectory line
+            const chargeRatio = this.bombChargeTime / this.MAX_BOMB_CHARGE_TIME;
+            const startColor = [255, 255, 255]; // White
+            const endColor = [255, 0, 0]; // Red
+            const r = Math.round(lerp(startColor[0], endColor[0], chargeRatio));
+            const g = Math.round(lerp(startColor[1], endColor[1], chargeRatio));
+            const b = Math.round(lerp(startColor[2], endColor[2], chargeRatio));
+            ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, 0.7)`; // Color changes with charge
+            ctx.lineWidth = 2;
+            
+            // Draw the trajectory line segments
+            ctx.beginPath();
+            ctx.moveTo(this.trajectoryPoints[0].x, this.trajectoryPoints[0].y);
+            for (let i = 1; i < this.trajectoryPoints.length; i++) {
+                ctx.lineTo(this.trajectoryPoints[i].x, this.trajectoryPoints[i].y);
+            }
+            ctx.stroke();
+            
+            // Draw small circles at each point for emphasis
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.5)`;
+            for (const point of this.trajectoryPoints) {
+                ctx.beginPath();
+                ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            
+            ctx.restore(); // Restore context state (including line dash)
+        }
     }
 
     // Helper method to create rounded rectangles
-    private roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number, fillStyle: string | CanvasGradient) {
-        ctx.fillStyle = fillStyle;
+    private roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number, fillStyle: string | CanvasGradient, strokeOnly: boolean = false) {
         ctx.beginPath();
         ctx.moveTo(x + radius, y);
         ctx.lineTo(x + width - radius, y);
@@ -1408,7 +1534,14 @@ export class Player {
         ctx.lineTo(x, y + radius);
         ctx.quadraticCurveTo(x, y, x + radius, y);
         ctx.closePath();
-        ctx.fill();
+        
+        if (!strokeOnly) {
+            ctx.fillStyle = fillStyle;
+            ctx.fill();
+        }
+        if (ctx.strokeStyle !== 'transparent') {
+            ctx.stroke();
+        }
     }
 
     // Helper method to adjust color brightness
@@ -1521,12 +1654,20 @@ export class Player {
         // Calculate throw strength based on charge time
         const chargeRatio = this.bombChargeTime / this.MAX_BOMB_CHARGE_TIME;
         const throwStrength = lerp(this.MIN_BOMB_THROW_STRENGTH, this.MAX_BOMB_THROW_STRENGTH, chargeRatio);
+        // Calculate explosion size based on charge time (e.g., 0.5x to 1.5x)
+        const minExplosionSize = 0.5;
+        const maxExplosionSize = 1.5;
+        const explosionSize = lerp(minExplosionSize, maxExplosionSize, chargeRatio);
         
         const bombX = this.x + this.baseWidth / 2;
         const bombY = this.y + this.baseHeight / 4; // Throw from chest height
         
-        // Use the calculated strength when creating the bomb
-        this.bombs.push(new Bomb(bombX, bombY, this.facingDirection, throwStrength));
+        // Use the calculated strength, size and pass the player's callback AND ID
+        this.bombs.push(new Bomb(bombX, bombY, this.facingDirection, throwStrength, 
+            // Modify the callback passed to the bomb to include the player's ID
+            (ex, ey, esize) => this.onExplodeCallback(ex, ey, esize, this.id),
+            explosionSize
+        ));
         this.bombCooldown = 30; // Still apply a short cooldown after throwing
     }
 }

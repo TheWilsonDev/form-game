@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState } from "react";
 import { Player } from "../game/Player";
 import { Camera } from "../game/Camera";
 import { PerlinNoise } from "../game/utils";
+import io, { Socket } from "socket.io-client"; // <-- Import Socket.IO client
 
 // Interface for ground block data
 interface GroundBlockData {
@@ -19,11 +20,13 @@ const GameCanvas: React.FC = () => {
   const [isDebugMode, setIsDebugMode] = useState<boolean>(false); // Debug mode state
   // Sky background optimization
   const skyCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Socket.IO connection ref
+  const socketRef = useRef<Socket | null>(null);
 
   // Ref to store ground block data using a Map (key: "gridX,gridY")
   const groundMapRef = useRef<Map<string, GroundBlockData>>(new Map());
   const environmentInitializedRef = useRef<boolean>(false);
-  const blockSize = 50; // Size of each ground block
+  const blockSize = 25; // Size of each ground block (Halved from 50)
 
   // Key configurations
   const player1Keys = { left: "a", right: "d", jump: "w", bomb: "e" };
@@ -51,6 +54,36 @@ const GameCanvas: React.FC = () => {
       window.removeEventListener("keyup", handleKeyUp);
     };
   }, []);
+
+  // --- Network Connection Setup ---
+  useEffect(() => {
+    // Set the server URL using your specific IP address
+    const serverUrl = `http://10.143.128.85:3001`; // Use port 3001 (backend server)
+    console.log(`[Client] Connecting to server at ${serverUrl}...`); // Log connection attempt
+    socketRef.current = io(serverUrl);
+    const socket = socketRef.current;
+
+    socket.on("connect", () => {
+      console.log("[Client] Connected to Socket.IO server! ID:", socket.id);
+      // TODO: Send player identification/join request
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[Client] Disconnected from Socket.IO server. Reason:", reason);
+    });
+
+    socket.on("connect_error", (error) => {
+      console.error("[Client] Connection Error:", error);
+    });
+
+    // TODO: Add listeners for game events from the server (like 'playerMoved')
+
+    // Cleanup on component unmount
+    return () => {
+      console.log("[Client] Disconnecting socket...");
+      socket.disconnect();
+    };
+  }, []); // Empty dependency array ensures this runs only once on mount
 
   // Create sky canvas once
   const createSkyCanvas = (width: number, height: number) => {
@@ -119,6 +152,56 @@ const GameCanvas: React.FC = () => {
     skyCtx.fill();
   };
 
+  // --- Bomb Explosion Handler ---
+  const handleBombExplosion = (explosionX: number, explosionY: number, explosionSize: number, throwerId: string) => {
+    // --- Terrain Destruction ---
+    const baseExplosionRadius = 3.5 * blockSize;
+    const explosionRadius = baseExplosionRadius * explosionSize;
+    const effectRadiusGrid = Math.ceil(explosionRadius / blockSize);
+    const centerGridX = Math.floor(explosionX / blockSize);
+    const centerGridY = Math.floor(explosionY / blockSize);
+
+    for (let gy = centerGridY - effectRadiusGrid; gy <= centerGridY + effectRadiusGrid; gy++) {
+      for (let gx = centerGridX - effectRadiusGrid; gx <= centerGridX + effectRadiusGrid; gx++) {
+        const blockKey = `${gx},${gy}`;
+        if (groundMapRef.current.has(blockKey)) {
+          const blockCenterX = gx * blockSize + blockSize / 2;
+          const blockCenterY = gy * blockSize + blockSize / 2;
+          const distance = Math.sqrt(Math.pow(blockCenterX - explosionX, 2) + Math.pow(blockCenterY - explosionY, 2));
+          const destructionProbability = 1.0 - distance / explosionRadius;
+          const randomChance = Math.random();
+          if (distance < explosionRadius && randomChance < destructionProbability) {
+            groundMapRef.current.delete(blockKey);
+          }
+        }
+      }
+    }
+
+    // --- Player Damage ---
+    const damageRadius = explosionRadius * 1.2; // Slightly larger radius for player damage
+    const maxDamage = 40 * explosionSize; // Scale damage with explosion size
+    const players = [player1Ref.current, player2Ref.current];
+
+    players.forEach((player) => {
+      if (player && player.id !== throwerId) {
+        const playerCenterX = player.x + player.baseWidth / 2;
+        const playerCenterY = player.y + player.baseHeight / 2;
+        const distToPlayer = Math.sqrt(Math.pow(playerCenterX - explosionX, 2) + Math.pow(playerCenterY - explosionY, 2));
+
+        if (distToPlayer < damageRadius) {
+          // Calculate damage based on distance (more damage closer to center)
+          const damageFalloff = Math.max(0, 1 - distToPlayer / damageRadius);
+          const damageDealt = Math.round(maxDamage * damageFalloff);
+
+          player.takeDamage(damageDealt);
+
+          console.log(`${player.color} took ${damageDealt} damage! Health: ${player.currentHealth}`);
+          // TODO: Add visual feedback for taking damage (e.g., screen shake, flashing)
+        }
+      }
+    });
+  };
+
   // Game Setup and Loop
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -138,13 +221,13 @@ const GameCanvas: React.FC = () => {
 
     // Initialize noise generator
     const noiseGenerator = new PerlinNoise(12345); // Use a fixed seed
-    const noiseScale = 0.05;
-    const terrainAmplitude = 4; // Max height variation in blocks (can be adjusted)
+    const noiseScale = 0.025; // Halved to maintain visual frequency
+    const terrainAmplitude = 8; // Doubled to maintain visual height variation
 
     // Calculate total grid rows and set minimum ground level near the bottom
     const totalGridRows = Math.ceil(canvas.height / blockSize);
-    const minGroundGridY = totalGridRows - 22; // Lowered base level significantly (was - 2)
-    const terrainDepth = 10; // How many blocks deep to make the terrain
+    const minGroundGridY = totalGridRows - 44; // Doubled offset to keep same relative height
+    const terrainDepth = 20; // Doubled to fill same visual depth
 
     // Initialize environment only once
     if (!environmentInitializedRef.current) {
@@ -153,7 +236,7 @@ const GameCanvas: React.FC = () => {
 
       // --- Generate Terrain using Perlin Noise (Revised Approach) ---
       groundMapRef.current.clear();
-      const terrainWidthInBlocks = 200;
+      const terrainWidthInBlocks = 400; // Doubled to cover same world space
       const startTerrainX = -Math.floor(terrainWidthInBlocks / 2);
 
       for (let gx = startTerrainX; gx < startTerrainX + terrainWidthInBlocks; gx++) {
@@ -205,10 +288,15 @@ const GameCanvas: React.FC = () => {
       if (!player1Ref.current) {
         player1Ref.current = new Player(player1SpawnX, finalSpawnY, 50, 50);
         player1Ref.current.color = "#ff6b6b";
+        player1Ref.current.onExplodeCallback = handleBombExplosion; // Assign callback
       }
       if (!player2Ref.current) {
         player2Ref.current = new Player(player2SpawnX, finalSpawnY, 50, 50);
         player2Ref.current.color = "#6ba5ff";
+        // Set arm colors for Player 2
+        player2Ref.current.armColorLight = "#a2c2ff"; // Lighter blue
+        player2Ref.current.armColorDark = "#4a80d1"; // Darker blue
+        player2Ref.current.onExplodeCallback = handleBombExplosion; // Assign callback
       }
 
       environmentInitializedRef.current = true;
@@ -315,8 +403,8 @@ const GameCanvas: React.FC = () => {
       const distanceBottomFromCenter = Math.abs(maxPlayerY - viewCenterY);
       const requiredHalfHeight = Math.max(canvasWorldHeight / 2, playerDistanceY, distanceTopFromCenter, distanceBottomFromCenter);
 
-      // Add generous buffer (4 blocks in each direction)
-      const viewBuffer = blockSize * 4;
+      // Add smaller buffer (1 block in each direction)
+      const viewBuffer = blockSize * 1; // Reduced from blockSize * 4
 
       // Calculate final view bounds
       const viewLeft = viewCenterX - requiredHalfWidth - viewBuffer;
@@ -362,13 +450,13 @@ const GameCanvas: React.FC = () => {
 
               context.fillStyle = "yellow";
               context.font = "10px Arial";
-              context.fillText(`(${blockX}, ${blockY})`, blockX + 2, blockY + 10); // Show coords
+              context.fillText(`(${blockX.toFixed(0)}, ${blockY.toFixed(0)})`, blockX + 2, blockY + 10); // Show coords (fixed decimals)
             } else {
-              // Normal: Fill the block
+              // Normal: Fill the block (Removed strokeRect for performance)
               context.fillStyle = blockData.color;
               context.fillRect(blockX, blockY, blockSize, blockSize);
-              context.strokeStyle = "#444"; // Keep the original stroke for non-debug
-              context.strokeRect(blockX, blockY, blockSize, blockSize);
+              // context.strokeStyle = "#444"; // Keep the original stroke for non-debug - REMOVED
+              // context.strokeRect(blockX, blockY, blockSize, blockSize); // REMOVED
             }
           }
         }
@@ -380,6 +468,10 @@ const GameCanvas: React.FC = () => {
 
       player1.draw(context, isDebugMode, player2EyeMidpoint);
       player2.draw(context, isDebugMode, player1EyeMidpoint);
+
+      // --- Draw Bombs and Trajectories (ON TOP of players) ---
+      player1.drawBombs(context);
+      player2.drawBombs(context);
 
       // Draw Player World Coordinates (Debug Only - Inside camera transform)
       if (isDebugMode) {
